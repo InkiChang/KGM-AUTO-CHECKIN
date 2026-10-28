@@ -1,6 +1,8 @@
 name: 签到
 on:
   schedule:
+    # GitHub Actions 的 schedule 只支持 UTC，不支持 timezone 字段。
+    # UTC 17:10 = 北京时间 01:10（次日）
     - cron: "10 17 * * *"
   workflow_dispatch:
 
@@ -17,30 +19,66 @@ jobs:
 
       - name: 创建 Node 环境
         uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: 'npm'
+          cache-dependency-path: ./api/package-lock.json
 
       - name: 缓存依赖
+        id: cache-npm
         uses: actions/cache@v6
         with:
-          path: |
-            **/node_modules
-          key: Linux-node-${{ hashFiles('**/package-lock.json') }}
+          path: ./api/node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('./api/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
 
       - name: 安装依赖
-        run: npm install --registry=https://registry.npmmirror.com/api
+        run: npm run install
+        if: ${{ steps.cache-npm.outputs.cache-hit != 'true' }}
 
-      # 失败也要继续执行通知步骤
       - name: 执行签到
-        id: checkin
+        id: main
         continue-on-error: true
         run: |
-          set +e
-          node main.js 2>&1 | tee signin.log
+          set -o pipefail
+          npm run main 2>&1 | tee signin.log
           echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+        env:
+          USERINFO: ${{ secrets.USERINFO }}
+          PAT: ${{ secrets.PAT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          # 通知渠道
+          WECOM_BOT_KEY: ${{ secrets.WECOM_BOT_KEY }}
+          DINGTALK_BOT_KEY: ${{ secrets.DINGTALK_BOT_KEY }}
+          DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
+          FEISHU_BOT_KEY: ${{ secrets.FEISHU_BOT_KEY }}
+          YUNHU_BOT_KEY: ${{ secrets.YUNHU_BOT_KEY }}
+          SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          PUSHPLUS_TOPIC: ${{ secrets.PUSHPLUS_TOPIC }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          BARK_KEY: ${{ secrets.BARK_KEY }}
+          BARK_GROUP: ${{ secrets.BARK_GROUP }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          MAIL_HOST: ${{ secrets.MAIL_HOST }}
+          MAIL_PORT: ${{ secrets.MAIL_PORT }}
+          MAIL_USER: ${{ secrets.MAIL_USER }}
+          MAIL_PASS: ${{ secrets.MAIL_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
 
       - name: 企微应用消息通知
+        if: ${{ !cancelled() }}
+        env:
+          WECOM_CORPID: ${{ secrets.WECOM_CORPID }}
+          WECOM_CORP_SECRET: ${{ secrets.WECOM_CORP_SECRET }}
+          WECOM_AGENTID: ${{ secrets.WECOM_AGENTID }}
+          CHECKIN_EXIT_CODE: ${{ steps.main.outputs.exit_code }}
+          GITHUB_RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           python3 - <<'PY'
-          import json, os, re
+          import json, os, re, subprocess
           lines = []
           try:
               with open('signin.log', encoding='utf-8', errors='ignore') as f:
@@ -57,13 +95,12 @@ jobs:
                       accts.append(seg[:160])
                   if '失败' in seg or '失效' in seg:
                       fails.append(seg[:160])
-          # 错误明细兜底
           for l in lines:
               if any(k in l for k in ['error_code', '异常信息如下', '需重新登录', 'Error:']):
                   if l not in fails and len(fails) < 10:
                       fails.append(l[:160])
           emoji = '✅' if ok else '❌'
-          head = f"[KGM] 酷狗签到 {os.popen('date -u \"+%m-%d %H:%M\"').read().strip()} {emoji}{'正常' if ok else '异常(exit '+exit_code+')'}"
+          head = f"[KGM] 酷狗签到 {subprocess.run(['date','-u','+%m-%d %H:%M'],capture_output=True,text=True).stdout.strip()} {emoji}{'正常' if ok else '异常(exit '+exit_code+')'}"
           msg = [head, '─' * 30, '📋 执行明细:']
           msg += ['  · ' + a for a in accts[-8:]] if accts else ['ℹ️ 无账号执行记录（跳过或未配置账号）']
           if fails:
@@ -77,7 +114,10 @@ jobs:
           with open('notify_content.json', 'w', encoding='utf-8') as f:
               json.dump(content, f, ensure_ascii=False)
           PY
-          TOKEN=$(curl -s "https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=${WECOM_CORPID}&corpsecret=${WECOM_CORP_SECRET}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))")
+          TOKEN=$(curl -s -G "https://qyapi.weixin.qq.com/cgi-bin/gettoken" \
+            --data-urlencode "corpid=${WECOM_CORPID}" \
+            --data-urlencode "corpsecret=${WECOM_CORP_SECRET}" \
+            | python3 -c "import sys,json;print(json.load(sys.stdin).get('access_token',''))")
           if [ -z "$TOKEN" ]; then
             echo "gettoken 失败，无法发送企微消息"
             exit 0
@@ -85,9 +125,3 @@ jobs:
           curl -s "https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${TOKEN}" \
             -H 'Content-Type: application/json' \
             -d "{\"touser\":\"@all\",\"msgtype\":\"text\",\"agentid\":${WECOM_AGENTID},\"text\":{\"content\":$(cat notify_content.json)}}"
-        env:
-          WECOM_CORPID: ${{ secrets.WECOM_CORPID }}
-          WECOM_CORP_SECRET: ${{ secrets.WECOM_CORP_SECRET }}
-          WECOM_AGENTID: ${{ secrets.WECOM_AGENTID }}
-          CHECKIN_EXIT_CODE: ${{ steps.checkin.outputs.exit_code }}
-          GITHUB_RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
